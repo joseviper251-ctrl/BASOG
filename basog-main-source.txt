@@ -1,0 +1,1481 @@
+--// Rayfield UI - Spooky Hub (merged: zero-gun-spread, auto-035, hitbox-finished, instant-firerate-done, autokill-finished, weapon-shot-limit, firelock, scp-list-fix, spread-restore, hitbox-mtf, misc-buttons, barrier-scan)
+local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Teams = game:GetService("Teams")
+
+local player = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+--// PREMIUM SYSTEM
+local HasPremiumKey = true
+
+local function CheckPremium(featureName)
+    if not HasPremiumKey then
+        Rayfield:Notify({
+            Title = "Premium Feature Locked",
+            Content = featureName .. " - Premium users only! Buy a key in the discord",
+            Duration = 4,
+            Image = 4483362458,
+        })
+        return false
+    end
+    return true
+end
+
+--// Variables
+local ExitESPEnabled = false
+local ExitESPObjects = {}
+local TeamESPConnections = {}
+local SelectedESPTeams = { ["MTF"] = true, ["Guard"] = true, ["SCP"] = true }
+
+local CFloop = nil
+local CFspeed = 50
+
+local WeaponStats = nil
+local OriginalFireRates = {}
+local OriginalSpreads = {}
+
+local AutoKillEnabled = false
+local GunShotEvent = nil
+local AutoKillLoopRunning = false
+local AutoKillTargets = { ["SCP"] = true }
+local AutoKillTargetSCPs = {}
+local AutoKillAll = false
+local AutoKillDropdown = nil
+local InstantFire = true   -- background constant, always ON
+
+--// Fire lock (prevents packet flood / keeps firing after toggle off)
+local fireLock = 0
+
+--// TP Walk Variables
+local tpwalking = nil
+local tpwalkEnabled = false
+local tpwalkSpeed = 1
+
+--// Hitbox Variables
+local HITBOX_SIZE = Vector3.new(16, 16, 16)
+local HITBOX_TRANSPARENCY = 0.5
+local activeTeams = {}
+local hitboxParts = {}
+local hitboxDeathConns = {}
+local hitboxEnabled = false
+
+local TEAM_KEYWORDS = {
+    Guard = {"guard", "gd"},
+    SCP   = {"scp"},
+    MTF   = {"mtf", "mobile task force", "task force"},
+}
+
+--// Gun Mods Variables (zero-gun-spread + instant-firerate)
+local BurstEnabled = false
+local MaxRange = 500
+local AimTolerance = 8
+local TargetTeams = { ["SCP"] = true }
+local AutoShootEnabled = false
+local AutoShootDelay = 0.05
+local lastAutoShot = 0
+local toolConn = nil
+
+--// Burst Shots state
+local BurstShotsPerClick = 5
+
+--// Rayfield Window
+local Window = Rayfield:CreateWindow({
+    Name = "Spooky Hub",
+    LoadingTitle = "Loading...",
+    LoadingSubtitle = "made By The Secret Lair",
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "SpookyHub",
+        FileName = "Config"
+    },
+    Discord = { Enabled = false },
+    KeySystem = false,
+})
+
+local MainTab = Window:CreateTab("Main", 4483362458)
+local GunModsTab = Window:CreateTab("Gun Mods", 4483362458)
+local ESPTab = Window:CreateTab("ESP", 4483362458)
+local MovementTab = Window:CreateTab("Movement", 4483362458)
+local HitboxTab = Window:CreateTab("Hitbox", 4483362458)
+local MiscTab = Window:CreateTab("Misc", 4483362458)
+
+--// AUTO KILL SYSTEM (autokill-finished)
+local SHOT_PACKET
+do
+    local bytes = {
+        1, 235, 149, 185, 193,
+        25, 207, 51, 194,
+        16, 12, 158, 195,
+        106, 161, 204, 193,
+        100, 238, 52, 194,
+        226, 106, 148, 195
+    }
+    local b = buffer.create(#bytes)
+    for i = 1, #bytes do
+        buffer.writeu8(b, i - 1, bytes[i])
+    end
+    SHOT_PACKET = b
+end
+
+local SCP_NAMES = {
+    "SCP-049", "SCP-173", "SCP-096", "SCP-106",
+    "SCP-457", "SCP-035", "SCP-966", "SCP-682",
+}
+
+local function getPlayerForSCP(scpName)
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            local char = p.Character
+            if char then
+                if char.Name == scpName then return p end
+                for _, obj in ipairs(char:GetChildren()) do
+                    if obj.Name == scpName then return p end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function buildOptions()
+    local opts = { "All", "Guard", "MTF" }
+    for _, scpName in ipairs(SCP_NAMES) do
+        local owner = getPlayerForSCP(scpName)
+        if owner then
+            table.insert(opts, scpName .. " (" .. owner.Name .. ")")
+        else
+            table.insert(opts, scpName .. " (empty)")
+        end
+    end
+    return opts
+end
+
+local function playerMatchesTarget(targetPlayer)
+    if AutoKillAll then return true end
+    if targetPlayer.Team and AutoKillTargets[targetPlayer.Team.Name] then return true end
+    local char = targetPlayer.Character
+    if char then
+        for _, scpName in ipairs(SCP_NAMES) do
+            if AutoKillTargetSCPs[scpName] then
+                if char.Name == scpName then return true end
+                for _, obj in ipairs(char:GetChildren()) do
+                    if obj.Name == scpName then return true end
+                end
+            end
+        end
+    end
+    return false
+end
+
+--// SHOTS-PER-SHOT RESOLVER (weapon-based, premium-gated)
+local function getEquippedTool()
+    local char = player.Character
+    if not char then return nil end
+    return char:FindFirstChildOfClass("Tool")
+end
+
+local function getWeaponData()
+    local tool = getEquippedTool()
+    if not tool then return nil end
+    local success, stats = pcall(function()
+        if not WeaponStats then
+            WeaponStats = require(ReplicatedStorage:WaitForChild('WeaponStats'))
+        end
+        return WeaponStats
+    end)
+    if not success or not stats then return nil end
+    return stats[tool.Name], tool
+end
+
+local function getShotsForWeapon()
+    if not HasPremiumKey then return 1 end
+    local data = getWeaponData()
+    if not data then return 1 end
+    local shots = data.Shots or 1
+    if data.Automatic and data.Shots == 1 then
+        shots = data.MagSize or 1
+    end
+    return math.max(1, math.floor(shots))
+end
+
+-- How long to wait before firing the same target again.
+-- Full-auto (whole-mag dump): wait the reload time.
+-- Otherwise: wait the weapon's firerate.
+local function getFireCooldown()
+    local data = getWeaponData()
+    if not data then return 0.1 end
+    if not HasPremiumKey then return data.Firerate or 0.1 end
+    if data.Automatic and data.Shots == 1 then
+        return (data.ReloadTime or 2) + 0.1
+    end
+    return data.Firerate or 0.1
+end
+
+local function canFire()
+    return tick() >= fireLock
+end
+
+local function markFired()
+    fireLock = tick() + getFireCooldown()
+end
+
+local function fireAt(targetPlayer)
+    if not canFire() then return end
+    local character = targetPlayer.Character
+    if not character then return end
+    local rightArm = character:FindFirstChild("Right Arm")
+    if not rightArm then return end
+
+    local shots = getShotsForWeapon()
+    for _ = 1, shots do
+        GunShotEvent:FireServer("shoot", SHOT_PACKET, { targetPlayer }, { rightArm })
+    end
+    markFired()
+end
+
+local function startAutoKill()
+    if not GunShotEvent then
+        task.spawn(function()
+            local events = ReplicatedStorage:WaitForChild("Events", 30)
+            if events then
+                GunShotEvent = events:WaitForChild("GunShot", 30)
+                if GunShotEvent then
+                    Rayfield:Notify({
+                        Title = "Auto Kill",
+                        Content = "GunShot event found - Auto Kill ready!",
+                        Duration = 3,
+                    })
+                end
+            end
+        end)
+    end
+    if not AutoKillLoopRunning then
+        AutoKillLoopRunning = true
+        task.spawn(function()
+            while AutoKillLoopRunning do
+                if InstantFire then
+                    RunService.Heartbeat:Wait()
+                else
+                    task.wait(0.1)
+                end
+                if AutoKillEnabled and GunShotEvent then
+                    for _, targetPlayer in ipairs(Players:GetPlayers()) do
+                        if targetPlayer ~= player and playerMatchesTarget(targetPlayer) then
+                            fireAt(targetPlayer)
+                        end
+                    end
+                end
+            end
+        end)
+    end
+end
+
+local function stopAutoKill()
+    AutoKillEnabled = false
+    fireLock = 0
+end
+
+--// BURST SHOTS (Method 3 fast fire, remote burst on click, locked at 5 shots/click)
+local function burstShots_HookTool(tool)
+    if toolConn then toolConn:Disconnect() end
+    toolConn = tool.Activated:Connect(function()
+        if not BurstEnabled then return end
+        if not GunShotEvent then return end
+        local char = player.Character
+        if not char then return end
+        local rightArm = char:FindFirstChild("Right Arm")
+        if not rightArm then return end
+        for _ = 1, BurstShotsPerClick do
+            GunShotEvent:FireServer("shoot", SHOT_PACKET, {}, { rightArm })
+        end
+    end)
+end
+
+local function burstShots_WatchCharacter(char)
+    char.ChildAdded:Connect(function(child)
+        if child:IsA("Tool") then burstShots_HookTool(child) end
+    end)
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Tool") then burstShots_HookTool(child) end
+    end
+end
+
+if player.Character then burstShots_WatchCharacter(player.Character) end
+player.CharacterAdded:Connect(burstShots_WatchCharacter)
+
+--// METHOD 1 NO SPREAD (direct table edit, Spread = 0)
+local function applyZeroSpread()
+    local success = pcall(function()
+        if not WeaponStats then
+            WeaponStats = require(ReplicatedStorage:WaitForChild('WeaponStats'))
+        end
+        OriginalSpreads = {}
+        for name, stats in pairs(WeaponStats) do
+            if typeof(stats) == "table" and stats.Spread ~= nil then
+                OriginalSpreads[name] = stats.Spread
+                stats.Spread = 0
+            end
+        end
+    end)
+    if success then
+        Rayfield:Notify({Title = "Zero Spread", Content = "Enabled", Duration = 2})
+    else
+        Rayfield:Notify({Title = "Error", Content = "Could not enable zero spread", Duration = 2})
+    end
+    return success
+end
+
+local function disableZeroSpread()
+    if not WeaponStats then return end
+    for name, original in pairs(OriginalSpreads) do
+        if WeaponStats[name] then
+            WeaponStats[name].Spread = original
+        end
+    end
+    OriginalSpreads = {}
+    Rayfield:Notify({Title = "Zero Spread", Content = "Disabled", Duration = 2})
+end
+
+--// Fly
+local function startFly()
+    if CFloop then CFloop:Disconnect() end
+    local character = player.Character
+    if not character then return end
+    local humanoid = character:FindFirstChildOfClass('Humanoid')
+    local head = character:WaitForChild("Head")
+    if humanoid then humanoid.PlatformStand = true end
+    head.Anchored = true
+
+    CFloop = RunService.Heartbeat:Connect(function(deltaTime)
+        if not player.Character then return end
+        local hum = player.Character:FindFirstChildOfClass('Humanoid')
+        local hd = player.Character:FindFirstChild("Head")
+        if not hum or not hd then return end
+
+        local moveDirection = hum.MoveDirection * (CFspeed * deltaTime)
+        local headCFrame = hd.CFrame
+        local cameraCFrame = Camera.CFrame
+        local cameraOffset = headCFrame:ToObjectSpace(cameraCFrame).Position
+        cameraCFrame = cameraCFrame * CFrame.new(-cameraOffset.X, -cameraOffset.Y, -cameraOffset.Z + 1)
+        local cameraPosition = cameraCFrame.Position
+        local headPosition = headCFrame.Position
+
+        local objectSpaceVelocity = CFrame.new(cameraPosition, Vector3.new(headPosition.X, cameraPosition.Y, headPosition.Z)):VectorToObjectSpace(moveDirection)
+        hd.CFrame = CFrame.new(headPosition) * (cameraCFrame - cameraPosition) * CFrame.new(objectSpaceVelocity)
+    end)
+    Rayfield:Notify({Title = "Invisible Fly", Content = "Enabled", Duration = 2})
+end
+
+local function stopFly()
+    if CFloop then
+        CFloop:Disconnect()
+        CFloop = nil
+    end
+    local character = player.Character
+    if not character then return end
+    local humanoid = character:FindFirstChildOfClass('Humanoid')
+    local head = character:FindFirstChild("Head")
+    if humanoid then humanoid.PlatformStand = false end
+    if head then head.Anchored = false end
+    Rayfield:Notify({Title = "Invisible Fly", Content = "Disabled", Duration = 2})
+end
+
+--// TP WALK
+local function startTpwalk()
+    if tpwalking then tpwalking:Disconnect() end
+    local character = player.Character or player.CharacterAdded:Wait()
+    local humanoid = character:WaitForChild("Humanoid")
+
+    tpwalking = RunService.Heartbeat:Connect(function(delta)
+        if not tpwalkEnabled then return end
+        if not (character and character.Parent and humanoid and humanoid.Parent) then
+            tpwalking:Disconnect()
+            return
+        end
+        if humanoid.MoveDirection.Magnitude > 0 then
+             character:TranslateBy(humanoid.MoveDirection * tpwalkSpeed * delta * 10)
+        end
+    end)
+end
+
+local function stopTpwalk()
+    if tpwalking then
+        tpwalking:Disconnect()
+        tpwalking = nil
+    end
+end
+
+--// HITBOX SYSTEM (hitbox-finished + MTF)
+local function findTeam(keywordList)
+    for _, team in ipairs(Teams:GetChildren()) do
+        local name = team.Name:lower()
+        for _, kw in ipairs(keywordList) do
+            if name:find(kw, 1, true) then
+                return team
+            end
+        end
+    end
+    return nil
+end
+
+local teamMap = {}
+local dropdownOptions = {}
+
+-- Build team map from keywords, ensuring MTF/Guard/SCP are always present
+for label, keywords in pairs(TEAM_KEYWORDS) do
+    local team = findTeam(keywords)
+    if team then
+        teamMap[label] = team
+        table.insert(dropdownOptions, label)
+    end
+end
+
+-- Fallback: if a keyword match failed (e.g. MTF team named differently), grab any remaining teams
+if #dropdownOptions < 3 then
+    for _, team in ipairs(Teams:GetChildren()) do
+        local alreadyMapped = false
+        for _, mapped in pairs(teamMap) do
+            if mapped == team then alreadyMapped = true break end
+        end
+        if not alreadyMapped then
+            teamMap[team.Name] = team
+            table.insert(dropdownOptions, team.Name)
+        end
+    end
+end
+
+-- Guarantee MTF/Guard/SCP are in the dropdown even if no matching team object exists yet
+local function ensureTeamOption(label)
+    for _, opt in ipairs(dropdownOptions) do
+        if opt == label then return end
+    end
+    table.insert(dropdownOptions, label)
+end
+ensureTeamOption("MTF")
+ensureTeamOption("Guard")
+ensureTeamOption("SCP")
+
+local function resolveTeam(label)
+    if teamMap[label] then return teamMap[label] end
+    local keywords = TEAM_KEYWORDS[label]
+    if keywords then
+        local team = findTeam(keywords)
+        if team then
+            teamMap[label] = team
+            return team
+        end
+    end
+    for _, team in ipairs(Teams:GetChildren()) do
+        if team.Name == label then
+            teamMap[label] = team
+            return team
+        end
+    end
+    return nil
+end
+
+local function removeHitbox(character)
+    if hitboxParts[character] then
+        hitboxParts[character]:Destroy()
+        hitboxParts[character] = nil
+    end
+    if hitboxDeathConns[character] then
+        hitboxDeathConns[character]:Disconnect()
+        hitboxDeathConns[character] = nil
+    end
+end
+
+local function createHitbox(character)
+    if not character then return end
+    local hrp = character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+
+    removeHitbox(character)
+
+    local part = Instance.new("Part")
+    part.Name = "CustomHitbox"
+    part.Size = HITBOX_SIZE
+    part.Transparency = HITBOX_TRANSPARENCY
+    part.Color = Color3.fromRGB(255, 0, 0)
+    part.Material = Enum.Material.Neon
+    part.CanCollide = false
+    part.Massless = true
+    part.Anchored = false
+    part.CFrame = hrp.CFrame
+    part.Parent = character
+
+    local weld = Instance.new("WeldConstraint")
+    weld.Part0 = part
+    weld.Part1 = hrp
+    weld.Parent = part
+
+    hitboxParts[character] = part
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        hitboxDeathConns[character] = humanoid.Died:Connect(function()
+            removeHitbox(character)
+        end)
+    end
+end
+
+local function shouldHaveHitbox(p)
+    if not hitboxEnabled then return false end
+    if not p.Team then return false end
+    return activeTeams[p.Team.Name] == true
+end
+
+local function refreshAll()
+    for _, p in ipairs(Players:GetPlayers()) do
+        local char = p.Character
+        if shouldHaveHitbox(p) and char then
+            createHitbox(char)
+        else
+            if char then removeHitbox(char) end
+        end
+    end
+end
+
+Players.PlayerAdded:Connect(function(p)
+    p.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        if shouldHaveHitbox(p) then
+            createHitbox(char)
+        end
+    end)
+end)
+
+for _, p in ipairs(Players:GetPlayers()) do
+    p.CharacterAdded:Connect(function(char)
+        task.wait(0.5)
+        if shouldHaveHitbox(p) then
+            createHitbox(char)
+        end
+    end)
+end
+
+RunService.Heartbeat:Connect(function()
+    for char, part in pairs(hitboxParts) do
+        if not char.Parent or not char:FindFirstChild("HumanoidRootPart") then
+            removeHitbox(char)
+        end
+    end
+end)
+
+--// AUTO-035 (manual only - teleports to mesh part, spams until transformed)
+local CLICK_RANGE_035 = 12
+local OFFSET_FROM_MESH_035 = Vector3.new(0, 0, 0)
+local SPAM_INTERVAL_035 = 0.08
+local ManualSpamming035 = false
+
+local function get035Model()
+    local f = workspace:FindFirstChild("Facility")
+    if not f then return nil end
+    local s = f:FindFirstChild("Special")
+    if not s then return nil end
+    local direct = s:FindFirstChild("SCP-035")
+    if direct then return direct end
+    for _, child in ipairs(s:GetChildren()) do
+        if child.Name:find("SCP%-035") or child.Name:find("SCP035") then
+            return child
+        end
+    end
+    return nil
+end
+
+-- Physically-in-game check: real SpecialMesh, live part, part actually rendered.
+local function get035MeshObject()
+    local scp = get035Model()
+    if not scp then return nil end
+    if not scp.Parent then return nil end
+    if not scp:IsDescendantOf(workspace) then return nil end
+
+    for _, d in ipairs(scp:GetDescendants()) do
+        if d:IsA("SpecialMesh") then
+            local part = d.Parent
+            if part and part:IsA("BasePart") and part:IsDescendantOf(workspace) then
+                -- Part must actually be visible / rendered
+                if part.Transparency < 1
+                    and part.Position.Magnitude > 0
+                    and d.MeshId ~= nil
+                    and d.MeshId ~= "" then
+                    return d
+                end
+            end
+        end
+    end
+    return nil
+end
+
+local function get035TargetPart()
+    local mesh = get035MeshObject()
+    if not mesh then return nil end
+    local parent = mesh.Parent
+    if parent and parent:IsA("BasePart") then return parent end
+    return nil
+end
+
+local function get035ClickDetector()
+    local scp = get035Model()
+    if not scp then return nil end
+    local direct = scp:FindFirstChild("ClickDetector")
+    if direct then return direct end
+    for _, d in ipairs(scp:GetDescendants()) do
+        if d:IsA("ClickDetector") then return d end
+    end
+    return nil
+end
+
+local function getHRP()
+    local char = player.Character
+    return char and char:FindFirstChild("HumanoidRootPart")
+end
+
+local function isPlayer035()
+    local char = player.Character
+    if not char then return false end
+    if char.Name:find("SCP%-035") or char.Name:find("SCP035") then return true end
+    for _, obj in ipairs(char:GetChildren()) do
+        if obj.Name:find("SCP%-035") or obj.Name:find("SCP035") then return true end
+    end
+    return false
+end
+
+-- Presence check: mesh physically rendered in the world
+local function is035Present()
+    return get035MeshObject() ~= nil
+end
+
+local function distanceToMesh035()
+    local part = get035TargetPart()
+    local hrp = getHRP()
+    if not part or not hrp then return math.huge end
+    return (hrp.Position - part.Position).Magnitude
+end
+
+local function inRange035()
+    return distanceToMesh035() <= CLICK_RANGE_035
+end
+
+local function teleportToMesh035()
+    local part = get035TargetPart()
+    local hrp = getHRP()
+    if not part or not hrp then return false end
+    hrp.CFrame = CFrame.new(part.Position + OFFSET_FROM_MESH_035)
+    return true
+end
+
+local function fireClick035()
+    local cd = get035ClickDetector()
+    if not cd then return false end
+    fireclickdetector(cd)
+    return true
+end
+
+local function startManualSpam035()
+    if not is035Present() then return false end
+    if isPlayer035() then return false end
+    ManualSpamming035 = true
+    task.spawn(function()
+        while ManualSpamming035 and not isPlayer035() do
+            if is035Present() then
+                teleportToMesh035()
+                if inRange035() then
+                    fireClick035()
+                end
+            end
+            task.wait(SPAM_INTERVAL_035)
+        end
+        ManualSpamming035 = false
+    end)
+    return true
+end
+
+--// INSTANT FAST FIRE (instant-firerate-done) - crosshair raycast + autoshoot
+local function teamAllowed(targetPlayer)
+    if not targetPlayer.Team then return false end
+    return TargetTeams[targetPlayer.Team.Name] == true
+end
+
+local function playerFromHit(hit)
+    if not hit then return nil end
+    local model = hit:FindFirstAncestorOfClass("Model")
+    while model do
+        local p = Players:GetPlayerFromCharacter(model)
+        if p then
+            if p ~= player and teamAllowed(p) then
+                return p
+            end
+            return nil
+        end
+        model = model:FindFirstAncestorOfClass("Model")
+    end
+    return nil
+end
+
+local function getTargetUnderCrosshair()
+    if not Camera then return nil end
+    local origin = Camera.CFrame.Position
+    local direction = Camera.CFrame.LookVector * MaxRange
+
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = { player.Character }
+
+    local result = Workspace:Raycast(origin, direction, params)
+    local hitPlayer = playerFromHit(result and result.Instance)
+    if hitPlayer then return hitPlayer end
+
+    local offsets = {
+        Vector3.new(AimTolerance, 0, 0),
+        Vector3.new(-AimTolerance, 0, 0),
+        Vector3.new(0, AimTolerance, 0),
+        Vector3.new(0, -AimTolerance, 0),
+    }
+    for _, off in ipairs(offsets) do
+        local fanOrigin = origin + Camera.CFrame:VectorToWorldSpace(off)
+        local fanResult = Workspace:Raycast(fanOrigin, direction, params)
+        local fanPlayer = playerFromHit(fanResult and fanResult.Instance)
+        if fanPlayer then return fanPlayer end
+    end
+    return nil
+end
+
+local function fireBurstAt(targetPlayer)
+    if not GunShotEvent or not targetPlayer then return end
+    if not canFire() then return end
+    local targetChar = targetPlayer.Character
+    local rightArm = targetChar and targetChar:FindFirstChild("Right Arm")
+    if not rightArm then return end
+
+    local shots = getShotsForWeapon()
+    for _ = 1, shots do
+        GunShotEvent:FireServer("shoot", SHOT_PACKET, { targetPlayer }, { rightArm })
+    end
+    markFired()
+end
+
+local function loadRemote()
+    if GunShotEvent then return end
+    task.spawn(function()
+        local events = ReplicatedStorage:WaitForChild("Events", 30)
+        if events then
+            GunShotEvent = events:WaitForChild("GunShot", 30)
+            if GunShotEvent then
+                Rayfield:Notify({
+                    Title = "Fast Fire",
+                    Content = "GunShot event found - ready!",
+                    Duration = 3,
+                })
+            end
+        end
+    end)
+end
+
+-- Autoshoot loop (fire-lock gated)
+task.spawn(function()
+    while true do
+        RunService.RenderStepped:Wait()
+        if AutoShootEnabled and GunShotEvent and canFire() then
+            local target = getTargetUnderCrosshair()
+            if target then
+                fireBurstAt(target)
+            end
+        end
+    end
+end)
+
+--// MAIN TAB
+MainTab:CreateSection("Combat")
+
+AutoKillDropdown = MainTab:CreateDropdown({
+    Name = "Autokill Target(s)",
+    Options = buildOptions(),
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "AutoKillTargets",
+    Callback = function(Options)
+        AutoKillTargets = {}
+        AutoKillTargetSCPs = {}
+        AutoKillAll = false
+        for _, opt in ipairs(Options) do
+            if opt == "All" then
+                AutoKillAll = true
+            elseif opt == "Guard" or opt == "MTF" or opt == "SCP" then
+                AutoKillTargets[opt] = true
+            else
+                local scpName = opt:match("^(SCP%-%d+)")
+                if scpName then
+                    AutoKillTargetSCPs[scpName] = true
+                end
+            end
+        end
+    end,
+})
+
+local AutoKillToggle = MainTab:CreateToggle({
+    Name = "Autokill (use with caution) [FREE]",
+    CurrentValue = false,
+    Flag = "AutoKillEnabled",
+    Callback = function(Value)
+        AutoKillEnabled = Value
+        if Value then
+            if not AutoKillAll and next(AutoKillTargets) == nil and next(AutoKillTargetSCPs) == nil then
+                Rayfield:Notify({
+                    Title = "Autokill",
+                    Content = "No target selected! Pick one in the dropdown.",
+                    Duration = 3,
+                })
+            end
+            startAutoKill()
+            Rayfield:Notify({Title = "Autokill", Content = "Enabled - hunting targets...", Duration = 2})
+        else
+            stopAutoKill()
+            Rayfield:Notify({Title = "Autokill", Content = "Disabled", Duration = 2})
+        end
+    end,
+})
+
+MainTab:CreateButton({
+    Name = "Refresh SCP List",
+    Callback = function()
+        local opts = buildOptions()
+        if AutoKillDropdown then AutoKillDropdown:Refresh(opts) end
+        Rayfield:Notify({Title = "Autokill", Content = "SCP list refreshed", Duration = 2})
+    end,
+})
+
+MainTab:CreateSection("SCP-035")
+
+-- Live presence bar for SCP-035 mesh
+local StatusBar035 = MainTab:CreateLabel("SCP-035: checking...")
+local lastStatus035 = ""
+
+MainTab:CreateButton({
+    Name = "SCP-035: Transform (spams until 035)",
+    Callback = function()
+        if not is035Present() then
+            Rayfield:Notify({Title = "SCP-035", Content = "SCP-035 not in game", Duration = 2})
+            return
+        end
+        if isPlayer035() then
+            Rayfield:Notify({Title = "SCP-035", Content = "You are already 035", Duration = 2})
+            return
+        end
+        local ok = startManualSpam035()
+        if ok then
+            Rayfield:Notify({Title = "SCP-035", Content = "Spamming until transformed...", Duration = 2})
+        end
+    end,
+})
+
+-- Status bar updater (per-frame, colored via Rayfield label text)
+RunService.RenderStepped:Connect(function()
+    local present = is035Present()
+    local transformed = isPlayer035()
+    local text
+    if transformed then
+        text = "🟢 YOU ARE SCP-035"
+    elseif present then
+        text = "🟢 SCP-035: IN GAME"
+    else
+        text = "🔴 SCP-035: NOT IN GAME"
+    end
+    if text ~= lastStatus035 then
+        lastStatus035 = text
+        if StatusBar035 then
+            StatusBar035:Set(text)
+        end
+    end
+end)
+
+-- Auto-refresh SCP list (only refresh when the option list actually changes)
+task.spawn(function()
+    local lastKey = ""
+    while true do
+        task.wait(3)
+        local opts = buildOptions()
+        local key = table.concat(opts, "|")
+        if key ~= lastKey then
+            lastKey = key
+            if AutoKillDropdown then
+                AutoKillDropdown:Refresh(opts)
+            end
+        end
+    end
+end)
+
+--// GUN MODS TAB (zero-gun-spread + instant-firerate-done)
+GunModsTab:CreateSection("Spread")
+
+GunModsTab:CreateToggle({
+    Name = "Zero Gun Spread [FREE]",
+    CurrentValue = false,
+    Flag = "ZeroSpread",
+    Callback = function(Value)
+        if Value then applyZeroSpread() else disableZeroSpread() end
+    end,
+})
+
+GunModsTab:CreateSection("Fire Rate")
+
+GunModsTab:CreateToggle({
+    Name = "Burst Shots (5 per click) [FREE]",
+    CurrentValue = false,
+    Flag = "BurstShots",
+    Callback = function(Value)
+        BurstEnabled = Value
+        if Value then
+            loadRemote()
+            Rayfield:Notify({Title = "Burst Shots", Content = "Enabled - 5 shots per click", Duration = 2})
+        else
+            Rayfield:Notify({Title = "Burst Shots", Content = "Disabled", Duration = 2})
+        end
+    end,
+})
+
+GunModsTab:CreateToggle({
+    Name = "Autoshoot (when target in crosshair/rays) [⭐ PREMIUM]",
+    CurrentValue = false,
+    Flag = "AutoShoot",
+    Callback = function(Value)
+        if Value and not CheckPremium("Autoshoot") then
+            task.wait()
+            return
+        end
+        AutoShootEnabled = Value
+        if Value then
+            loadRemote()
+            Rayfield:Notify({Title = "Autoshoot", Content = "Enabled - auto-fires on sight", Duration = 2})
+        else
+            fireLock = 0
+            Rayfield:Notify({Title = "Autoshoot", Content = "Disabled", Duration = 2})
+        end
+    end,
+})
+
+GunModsTab:CreateSlider({
+    Name = "Autoshoot Delay (min)",
+    Range = {0, 0.5},
+    Increment = 0.01,
+    Suffix = "s",
+    CurrentValue = 0.05,
+    Flag = "AutoShootDelay",
+    Callback = function(Value) AutoShootDelay = Value end,
+})
+
+GunModsTab:CreateSection("Targeting")
+
+GunModsTab:CreateDropdown({
+    Name = "Burst Target Team(s)",
+    Options = {"SCP", "Guard", "MTF"},
+    CurrentOption = {"SCP"},
+    MultipleOptions = true,
+    Flag = "BurstTargetTeams",
+    Callback = function(Options)
+        TargetTeams = {}
+        for _, teamName in ipairs(Options) do
+            TargetTeams[teamName] = true
+        end
+    end,
+})
+
+--// MOVEMENT TAB
+MovementTab:CreateSection("Flight [⭐ PREMIUM]")
+
+local FlyToggle = MovementTab:CreateToggle({
+    Name = "Invisible Fly (undetected) [⭐ PREMIUM]",
+    CurrentValue = false,
+    Flag = "CFly",
+    Callback = function(Value)
+        if Value and not CheckPremium("Invisible Fly") then
+            task.wait()
+            FlyToggle:Set(false)
+            return
+        end
+        if Value then startFly() else stopFly() end
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Fly Speed",
+    Range = {10, 200},
+    Increment = 5,
+    Suffix = "",
+    CurrentValue = 50,
+    Flag = "FlySpeed",
+    Callback = function(Value) CFspeed = Value end,
+})
+
+MovementTab:CreateSection("Speed [FREE]")
+
+MovementTab:CreateToggle({
+    Name = "Speed (use with caution)",
+    CurrentValue = false,
+    Flag = "TpWalkToggle",
+    Callback = function(value)
+        tpwalkEnabled = value
+        if value then startTpwalk() else stopTpwalk() end
+    end,
+})
+
+MovementTab:CreateSlider({
+    Name = "Speed Multiplier",
+    Range = {1, 5},
+    Increment = 1,
+    Suffix = "x",
+    CurrentValue = 1,
+    Flag = "TpWalkSpeed",
+    Callback = function(value) tpwalkSpeed = value end,
+})
+
+--// HITBOX TAB (hitbox-finished + MTF)
+HitboxTab:CreateSection("Hitbox")
+
+HitboxTab:CreateDropdown({
+    Name = "Select Team(s)",
+    Options = dropdownOptions,
+    CurrentOption = {},
+    MultipleOptions = true,
+    Flag = "TeamDropdown",
+    Callback = function(Options)
+        activeTeams = {}
+        for _, label in ipairs(Options) do
+            local team = resolveTeam(label)
+            if team then
+                activeTeams[team.Name] = true
+            else
+                local keywords = TEAM_KEYWORDS[label]
+                if keywords then
+                    for _, p in ipairs(Players:GetPlayers()) do
+                        if p.Team then
+                            local tName = p.Team.Name:lower()
+                            for _, kw in ipairs(keywords) do
+                                if tName:find(kw, 1, true) then
+                                    activeTeams[p.Team.Name] = true
+                                    break
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        refreshAll()
+    end,
+})
+
+HitboxTab:CreateToggle({
+    Name = "Hitboxes Enabled",
+    CurrentValue = false,
+    Flag = "HitboxEnabled",
+    Callback = function(Value)
+        hitboxEnabled = Value
+        if Value then
+            if next(activeTeams) == nil then
+                Rayfield:Notify({
+                    Title = "Hitbox",
+                    Content = "No team selected! Pick one in the dropdown.",
+                    Duration = 3,
+                })
+            end
+            refreshAll()
+        else
+            for char, _ in pairs(hitboxParts) do
+                removeHitbox(char)
+            end
+        end
+    end,
+})
+
+HitboxTab:CreateSlider({
+    Name = "Hitbox Size",
+    Range = {5, 25},
+    Increment = 1,
+    Suffix = "studs",
+    CurrentValue = 16,
+    Flag = "HitboxSize",
+    Callback = function(value)
+        HITBOX_SIZE = Vector3.new(value, value, value)
+        for _, part in pairs(hitboxParts) do
+            part.Size = HITBOX_SIZE
+        end
+    end,
+})
+
+HitboxTab:CreateSlider({
+    Name = "Hitbox Transparency",
+    Range = {0, 1},
+    Increment = 0.05,
+    Suffix = "",
+    CurrentValue = 0.5,
+    Flag = "HitboxTransparency",
+    Callback = function(value)
+        HITBOX_TRANSPARENCY = value
+        for _, part in pairs(hitboxParts) do
+            part.Transparency = HITBOX_TRANSPARENCY
+        end
+    end,
+})
+
+HitboxTab:CreateButton({
+    Name = "Refresh Hitboxes",
+    Callback = function() refreshAll() end,
+})
+
+--// ESP TAB
+local function findExitPart()
+    local pocketDimension = Workspace:FindFirstChild("Pocket Dimension")
+    if not pocketDimension then return nil end
+    local model = pocketDimension:FindFirstChild("Model")
+    if not model then return nil end
+    return model:FindFirstChild("Exit")
+end
+
+local function createExitESP()
+    if ExitESPObjects.Highlight then ExitESPObjects.Highlight:Destroy() end
+    if ExitESPObjects.Billboard then ExitESPObjects.Billboard:Destroy() end
+    if ExitESPObjects.Connection then ExitESPObjects.Connection:Disconnect() end
+
+    local targetPart = findExitPart()
+    if not targetPart then return false end
+
+    ExitESPObjects.Highlight = Instance.new("Highlight")
+    ExitESPObjects.Highlight.Name = "ExitESP_Highlight"
+    ExitESPObjects.Highlight.FillColor = Color3.fromRGB(0, 255, 0)
+    ExitESPObjects.Highlight.OutlineColor = Color3.fromRGB(0, 200, 0)
+    ExitESPObjects.Highlight.FillTransparency = 0.3
+    ExitESPObjects.Highlight.OutlineTransparency = 0
+    ExitESPObjects.Highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+    ExitESPObjects.Highlight.Adornee = targetPart
+    ExitESPObjects.Highlight.Parent = CoreGui
+
+    ExitESPObjects.Billboard = Instance.new("BillboardGui")
+    ExitESPObjects.Billboard.Name = "ExitESP_Label"
+    ExitESPObjects.Billboard.Size = UDim2.new(0, 300, 0, 60)
+    ExitESPObjects.Billboard.StudsOffset = Vector3.new(0, 5, 0)
+    ExitESPObjects.Billboard.AlwaysOnTop = true
+    ExitESPObjects.Billboard.Adornee = targetPart
+
+    local label = Instance.new("TextLabel")
+    label.Name = "ExitText"
+    label.Size = UDim2.new(1, 0, 0.6, 0)
+    label.BackgroundTransparency = 1
+    label.Text = "EXIT"
+    label.TextColor3 = Color3.fromRGB(0, 255, 0)
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 28
+    label.Parent = ExitESPObjects.Billboard
+
+    local distanceLabel = Instance.new("TextLabel")
+    distanceLabel.Name = "DistanceText"
+    distanceLabel.Size = UDim2.new(1, 0, 0.4, 0)
+    distanceLabel.Position = UDim2.new(0, 0, 0.6, 0)
+    distanceLabel.BackgroundTransparency = 1
+    distanceLabel.Text = "Distance: calculating..."
+    distanceLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    distanceLabel.TextStrokeTransparency = 0
+    distanceLabel.TextStrokeColor3 = Color3.fromRGB(0, 0, 0)
+    distanceLabel.Font = Enum.Font.GothamBold
+    distanceLabel.TextSize = 18
+    distanceLabel.Parent = ExitESPObjects.Billboard
+
+    ExitESPObjects.Billboard.Parent = CoreGui
+
+    ExitESPObjects.Connection = RunService.RenderStepped:Connect(function()
+        if not targetPart or not targetPart.Parent then
+            local newPart = findExitPart()
+            if newPart then
+                targetPart = newPart
+                ExitESPObjects.Highlight.Adornee = targetPart
+                ExitESPObjects.Billboard.Adornee = targetPart
+            end
+            return
+        end
+        if player.Character and player.Character:FindFirstChild("HumanoidRootPart") then
+            local distance = (player.Character.HumanoidRootPart.Position - targetPart.Position).Magnitude
+            distanceLabel.Text = string.format("Distance: %.1f studs", distance)
+        end
+    end)
+    return true
+end
+
+local function removeExitESP()
+    if ExitESPObjects.Highlight then ExitESPObjects.Highlight:Destroy() end
+    if ExitESPObjects.Billboard then ExitESPObjects.Billboard:Destroy() end
+    if ExitESPObjects.Connection then ExitESPObjects.Connection:Disconnect() end
+    ExitESPObjects = {}
+end
+
+local TeamColors = {
+    ["Guard"] = Color3.fromRGB(0, 0, 255),
+    ["MTF"] = Color3.fromRGB(0, 255, 0),
+    ["SCP"] = Color3.fromRGB(255, 0, 0),
+}
+local DefaultColor = Color3.fromRGB(255, 255, 255)
+
+local function applyTeamChams(character)
+    if not character then return end
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Highlight") and v.Name == "TeamChams" then v:Destroy() end
+    end
+    local targetPlayer = Players:GetPlayerFromCharacter(character)
+    if not targetPlayer then return end
+    local teamName = targetPlayer.Team and targetPlayer.Team.Name or "None"
+    if not SelectedESPTeams[teamName] then return end
+    local color = TeamColors[teamName] or DefaultColor
+
+    local highlight = Instance.new("Highlight")
+    highlight.Name = "TeamChams"
+    highlight.FillColor = color
+    highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+    highlight.FillTransparency = 0.5
+    highlight.OutlineTransparency = 0
+    highlight.Parent = character
+end
+
+local function removeTeamChams(character)
+    if not character then return end
+    for _, v in ipairs(character:GetChildren()) do
+        if v:IsA("Highlight") and v.Name == "TeamChams" then v:Destroy() end
+    end
+end
+
+local function refreshAllChams()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Character then
+            removeTeamChams(p.Character)
+            applyTeamChams(p.Character)
+        end
+    end
+end
+
+local function startTeamESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player then
+            if p.Character then applyTeamChams(p.Character) end
+            local charConn = p.CharacterAdded:Connect(applyTeamChams)
+            local teamConn = p:GetPropertyChangedSignal("Team"):Connect(function()
+                if p.Character then
+                    removeTeamChams(p.Character)
+                    applyTeamChams(p.Character)
+                end
+            end)
+            TeamESPConnections[p] = {charConn, teamConn}
+        end
+    end
+    TeamESPConnections.PlayerAdded = Players.PlayerAdded:Connect(function(p)
+        if p == player then return end
+        local charConn = p.CharacterAdded:Connect(applyTeamChams)
+        local teamConn = p:GetPropertyChangedSignal("Team"):Connect(function()
+            if p.Character then
+                removeTeamChams(p.Character)
+                applyTeamChams(p.Character)
+            end
+        end)
+        TeamESPConnections[p] = {charConn, teamConn}
+    end)
+end
+
+local function stopTeamESP()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then removeTeamChams(p.Character) end
+    end
+    for p, conns in pairs(TeamESPConnections) do
+        if p ~= "PlayerAdded" then
+            for _, conn in ipairs(conns) do conn:Disconnect() end
+        end
+    end
+    if TeamESPConnections.PlayerAdded then TeamESPConnections.PlayerAdded:Disconnect() end
+    TeamESPConnections = {}
+end
+
+ESPTab:CreateSection("World ESP [FREE]")
+
+ESPTab:CreateToggle({
+    Name = "Exit ESP (Pocket Dimension)",
+    CurrentValue = false,
+    Flag = "ExitESP",
+    Callback = function(Value)
+        ExitESPEnabled = Value
+        if Value then createExitESP() else removeExitESP() end
+    end,
+})
+
+ESPTab:CreateSection("Player ESP [FREE]")
+
+ESPTab:CreateDropdown({
+    Name = "Team Chams - Select Team(s)",
+    Options = {"MTF", "Guard", "SCP"},
+    CurrentOption = {"MTF", "Guard", "SCP"},
+    MultipleOptions = true,
+    Flag = "ESPTeamSelection",
+    Callback = function(Options)
+        SelectedESPTeams = {}
+        for _, teamName in ipairs(Options) do
+            SelectedESPTeams[teamName] = true
+        end
+        if TeamESPConnections and next(TeamESPConnections) then
+            refreshAllChams()
+        end
+    end,
+})
+
+ESPTab:CreateToggle({
+    Name = "Team Chams Enabled",
+    CurrentValue = false,
+    Flag = "TeamESP",
+    Callback = function(Value)
+        if Value then
+            if next(SelectedESPTeams) == nil then
+                Rayfield:Notify({
+                    Title = "Team Chams",
+                    Content = "No team selected! Pick one in the dropdown.",
+                    Duration = 3,
+                })
+            end
+            startTeamESP()
+        else
+            stopTeamESP()
+        end
+    end,
+})
+
+Workspace.DescendantAdded:Connect(function(descendant)
+    if ExitESPEnabled and descendant.Name == "Exit" and descendant:IsA("BasePart") then
+        local parent = descendant.Parent
+        if parent and parent.Name == "Model" then
+            local grandparent = parent.Parent
+            if grandparent and grandparent.Name == "Pocket Dimension" then
+                task.wait(0.1)
+                createExitESP()
+            end
+        end
+    end
+end)
+
+--// MISC TAB
+MiscTab:CreateSection("Facility")
+
+MiscTab:CreateButton({
+    Name = "Delete Spawn Barriers",
+    Callback = function()
+        local facility = workspace:FindFirstChild("Facility")
+        if not facility then
+            Rayfield:Notify({Title = "Barriers", Content = "Facility not found", Duration = 2})
+            return
+        end
+        local deleted = 0
+        for _, desc in ipairs(facility:GetDescendants()) do
+            if desc:IsA("BasePart") and desc.Name:lower():find("barrier", 1, true) then
+                desc:Destroy()
+                deleted = deleted + 1
+            end
+        end
+        if deleted > 0 then
+            Rayfield:Notify({Title = "Barriers", Content = "Deleted " .. deleted .. " barrier(s)", Duration = 2})
+        else
+            Rayfield:Notify({Title = "Barriers", Content = "No barriers found", Duration = 2})
+        end
+    end,
+})
+
+MiscTab:CreateButton({
+    Name = "Turn into zombie",
+    Callback = function()
+        local scp049 = getPlayerForSCP("SCP-049")
+        if not scp049 or not scp049.Character then
+            Rayfield:Notify({Title = "Zombie", Content = "SCP-049 not found", Duration = 2})
+            return
+        end
+        local targetHRP = scp049.Character:FindFirstChild("HumanoidRootPart")
+        local hrp = getHRP()
+        if targetHRP and hrp then
+            hrp.CFrame = targetHRP.CFrame
+            Rayfield:Notify({Title = "Zombie", Content = "Teleported to SCP-049", Duration = 2})
+        else
+            Rayfield:Notify({Title = "Zombie", Content = "Could not teleport", Duration = 2})
+        end
+    end,
+})
+
+MiscTab:CreateSection("UI Controls")
+
+MiscTab:CreateButton({
+    Name = "Unload UI",
+    Callback = function()
+        if CFloop then stopFly() end
+        if AutoKillEnabled then stopAutoKill() end
+        if tpwalkEnabled then stopTpwalk() end
+        if ExitESPEnabled then removeExitESP() end
+        if next(TeamESPConnections) then stopTeamESP() end
+        if WeaponStats then disableZeroSpread() end
+        if toolConn then toolConn:Disconnect() end
+        Rayfield:Destroy()
+    end,
+})
+
+MiscTab:CreateSection("Premium")
+
+MiscTab:CreateButton({
+    Name = "Get Premium Key",
+    Callback = function()
+        Rayfield:Notify({
+            Title = "Premium",
+            Content = "Join our Discord to buy a premium key!",
+            Duration = 4,
+        })
+        local success = pcall(function()
+            setclipboard("https://discord.gg/VfychVfg2t")
+        end)
+        if success then
+            Rayfield:Notify({Title = "Copied", Content = "Discord link copied to clipboard!", Duration = 2})
+        end
+    end,
+})
+
+--// CREDITS TAB
+local CreditsTab = Window:CreateTab("Credits", 4483362458)
+
+CreditsTab:CreateSection("✦ Script Developers ✦")
+
+CreditsTab:CreateParagraph({
+    Title = "The Secret Lair",
+    Content = "Development team behind Spooky Hub.",
+})
+
+CreditsTab:CreateSection("✦ About ✦")
+
+CreditsTab:CreateParagraph({
+    Title = "Spooky Hub",
+    Content = "A cool script made By The Secret Lair",
+})
+
+CreditsTab:CreateButton({
+    Name = "📋 Copy Discord Invite",
+    Callback = function()
+        local ok = pcall(function()
+            setclipboard("https://discord.gg/VfychVfg2t")
+        end)
+        if ok then
+            Rayfield:Notify({Title = "Copied", Content = "Discord invite copied to clipboard!", Duration = 2})
+        end
+    end,
+})
+
+--// Initialize
+Rayfield:Notify({
+    Title = "Spooky Hub Loaded",
+    Content = "ESP, Hitbox, Speed, Autokill & Burst Shots are FREE! ⭐ Premium for Fly & Autoshoot",
+    Duration = 5,
+    Image = 4483362458,
+})
